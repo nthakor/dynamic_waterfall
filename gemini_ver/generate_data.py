@@ -51,28 +51,6 @@ def generate_dummy_dataset(
     states = ["CA", "TX", "FL", "NY", "IL", "OH", "GA", "NC", "PA", "AZ"]
     risk_tiers = ["Prime", "Near-Prime", "Sub-Prime", "Deep-Sub-Prime"]
 
-    # Bad rate varies meaningfully by category (makes filters interesting)
-    product_bad_rates = {
-        "Personal Loan": 0.20,
-        "Credit Card": 0.18,
-        "Auto Loan": 0.12,
-        "Mortgage": 0.05,
-        "HELOC": 0.08,
-    }
-    channel_bad_rates = {
-        "Online": 0.16,
-        "Branch": 0.10,
-        "Broker": 0.22,
-        "Phone": 0.19,
-        "Partner": 0.14,
-    }
-    tier_bad_rates = {
-        "Prime": 0.04,
-        "Near-Prime": 0.12,
-        "Sub-Prime": 0.28,
-        "Deep-Sub-Prime": 0.45,
-    }
-
     product_arr = np.random.choice(product_types, size=n_records)
     channel_arr = np.random.choice(channels, size=n_records)
     state_arr = np.random.choice(states, size=n_records)

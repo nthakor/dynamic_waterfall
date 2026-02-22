@@ -19,6 +19,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 import os
+import io
 
 from analytics import (
     ColumnConfig,
@@ -107,6 +108,7 @@ def _init():
         "ungrouped": [],
         "df_raw": None,  # raw loaded df (no date enrichment yet)
         "df_enriched": None,  # df with _year / _quarter added
+        "uploaded_file_name": None,  # name of the currently active uploaded file
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -120,32 +122,60 @@ _init()
 # Data loading / generation
 # ─────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
-def _load(path: str) -> pd.DataFrame:
+def _load_path(path: str) -> pd.DataFrame:
+    """Load from a file-system path (cached)."""
     return load_data(path)
 
 
-def ensure_data():
+@st.cache_data(show_spinner=False)
+def _load_bytes(data: bytes) -> pd.DataFrame:
+    """Load from raw bytes (cached by content hash)."""
+    return pd.read_parquet(io.BytesIO(data), engine="pyarrow")
+
+
+def _reset_state(df_raw: pd.DataFrame):
+    """Detect column roles and reset all grouping state for a new dataset."""
+    cfg = detect_column_roles(df_raw)
+    st.session_state.col_config = cfg
+    st.session_state.ungrouped = list(cfg.rule_cols)
+    st.session_state.groups = {}
+    st.session_state.group_order = []
+    st.session_state.df_raw = df_raw
+    st.session_state.df_enriched = (
+        enrich_date_cols(df_raw, cfg.date_col) if cfg.date_col else df_raw
+    )
+    st.session_state.data_loaded = True
+
+
+def ensure_data(uploaded_file=None):
+    """
+    Returns (df_raw, df_enriched).
+    Priority: uploaded file > previously uploaded > generated dummy.
+    """
+    # ── New upload ────────────────────────────────────────────────────────
+    if uploaded_file is not None:
+        new_name = uploaded_file.name
+        if new_name != st.session_state.uploaded_file_name:
+            # File changed — reload & re-detect
+            with st.spinner(f"Loading '{new_name}'…"):
+                data = uploaded_file.read()
+                df_raw = _load_bytes(data)
+            _reset_state(df_raw)
+            st.session_state.uploaded_file_name = new_name
+            return st.session_state.df_raw, st.session_state.df_enriched
+
+    # ── Already loaded (same file or dummy) ──────────────────────────────
+    if st.session_state.data_loaded:
+        return st.session_state.df_raw, st.session_state.df_enriched
+
+    # ── First load: generate / read dummy dataset ─────────────────────────
     if not os.path.exists(DATA_PATH):
         with st.spinner("⚙️ Generating dummy dataset (100k records, 30 rules)…"):
             generate_dummy_dataset(n_records=100_000, n_rules=30, output_path=DATA_PATH)
 
-    df_raw = _load(DATA_PATH)
-
-    if not st.session_state.data_loaded:
-        cfg = detect_column_roles(df_raw)
-        st.session_state.col_config = cfg
-        st.session_state.ungrouped = list(cfg.rule_cols)
-        st.session_state.groups = {}
-        st.session_state.group_order = []
-        st.session_state.df_raw = df_raw
-
-        if cfg.date_col:
-            st.session_state.df_enriched = enrich_date_cols(df_raw, cfg.date_col)
-        else:
-            st.session_state.df_enriched = df_raw
-
-        st.session_state.data_loaded = True
-
+    df_raw = _load_path(DATA_PATH)
+    _reset_state(df_raw)
+    st.session_state.uploaded_file_name = None
     return st.session_state.df_raw, st.session_state.df_enriched
 
 
@@ -156,8 +186,24 @@ with st.sidebar:
     st.markdown("## 🌊 Rule Waterfall")
     st.markdown("---")
 
-    # ── Dataset settings ─────────────────────────────────────────────────
-    with st.expander("⚙️ Dataset Settings", expanded=False):
+    # ── Upload Data ───────────────────────────────────────────────────────
+    st.markdown("### 📂 Data Source")
+    uploaded_file = st.file_uploader(
+        "Upload a Parquet file",
+        type=["parquet"],
+        help="Upload any .parquet file. Column roles will be auto-detected immediately.",
+        label_visibility="collapsed",
+    )
+
+    if uploaded_file is None and st.session_state.uploaded_file_name is not None:
+        # User cleared the uploader — fall back to dummy dataset
+        _load_bytes.clear()
+        st.session_state.data_loaded = False
+        st.session_state.uploaded_file_name = None
+
+    # ── Dummy dataset settings ────────────────────────────────────────────
+    with st.expander("⚙️ Dummy Dataset Settings", expanded=False):
+        st.caption("Only used when no file is uploaded.")
         n_rec = st.selectbox(
             "Records",
             [10_000, 100_000, 500_000, 1_000_000, 3_000_000],
@@ -165,16 +211,17 @@ with st.sidebar:
             format_func=lambda x: f"{x:,}",
         )
         n_rules = st.slider("Number of Rules", 5, 200, 30)
-        if st.button("🔄 Regenerate Dataset"):
+        if st.button("🔄 Regenerate Dummy Dataset"):
             with st.spinner("Generating…"):
                 generate_dummy_dataset(
                     n_records=n_rec, n_rules=n_rules, output_path=DATA_PATH
                 )
-            _load.clear()
+            _load_path.clear()
             st.session_state.data_loaded = False
+            st.session_state.uploaded_file_name = None
             st.rerun()
 
-    df_raw, df_enriched = ensure_data()
+    df_raw, df_enriched = ensure_data(uploaded_file)
     cfg: ColumnConfig = st.session_state.col_config
     all_cols = list(df_raw.columns)
 
@@ -299,6 +346,20 @@ with st.sidebar:
         cat_filters=cat_filter_values or None,
     )
     st.markdown("---")
+
+    # Data source indicator
+    if st.session_state.uploaded_file_name:
+        src_html = (
+            f"<span style='background:#276749;color:#c6f6d5;padding:2px 8px;"
+            f"border-radius:10px;font-size:0.72rem;font-weight:600'>📂 "
+            f"{st.session_state.uploaded_file_name}</span>"
+        )
+    else:
+        src_html = (
+            "<span style='background:#2b6cb0;color:#bee3f8;padding:2px 8px;"
+            "border-radius:10px;font-size:0.72rem;font-weight:600'>🧪 Dummy Dataset</span>"
+        )
+    st.markdown(src_html, unsafe_allow_html=True)
     st.caption(
         f"**{len(df):,}** of {len(df_raw):,} records after filters  \n"
         f"Bad col: `{cfg.bad_col or 'none'}` · Rule cols: `{len(cfg.rule_cols)}`"
