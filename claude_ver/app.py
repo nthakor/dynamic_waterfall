@@ -633,7 +633,13 @@ def _render_column_setup(df: pd.DataFrame) -> None:
         for col, role in cfg.items()
     ])
 
-    edited = st.data_editor(
+    # Version-based key: incremented on every Apply so the editor resets to a
+    # clean slate with the new config, preventing the stale delta from the
+    # previous render being re-applied on top of already-updated roles.
+    ver        = ss().get("col_setup_ver", 0)
+    editor_key = f"cse_v{ver}"
+
+    st.data_editor(
         display,
         column_config={
             "Column":        st.column_config.TextColumn("Column",        disabled=True),
@@ -646,20 +652,37 @@ def _render_column_setup(df: pd.DataFrame) -> None:
         hide_index=True,
         use_container_width=True,
         height=min(600, 55 + 35 * len(cfg)),
-        key="col_setup_editor",
+        key=editor_key,
     )
 
     ca, cb, _ = st.columns([1, 1, 5])
     with ca:
         if st.button("✅ Apply Roles", type="primary", use_container_width=True):
-            new_cfg   = dict(zip(edited["Column"], edited["Role"]))
+            # Read the delta Streamlit stored for this editor instance directly
+            # from session state.  This is more reliable than the `edited` return
+            # value when a button click immediately follows a cell change, because
+            # Streamlit batches the edit event and the click event in one rerun —
+            # reading ss()[editor_key] guarantees we see the latest committed edits.
+            #
+            # Streamlit stores: {"edited_rows": {row_idx: {col: val}}, ...}
+            delta    = ss().get(editor_key, {})
+            result_df = display.copy()
+            for row_idx, changes in delta.get("edited_rows", {}).items():
+                for col_name, new_val in changes.items():
+                    result_df.at[int(row_idx), col_name] = new_val
+
+            new_cfg   = dict(zip(result_df["Column"], result_df["Role"]))
             old_cats  = {c for c, r in cfg.items() if r == "categorical"}
             new_cats  = {c for c, r in new_cfg.items() if r == "categorical"}
             old_rules = {c for c, r in cfg.items() if r == "rule"}
             new_rules = {c for c, r in new_cfg.items() if r == "rule"}
+
             for col in old_cats - new_cats:
                 ss().pop(f"catf_{col}", None)
-            ss().col_config = new_cfg
+
+            ss().col_config      = new_cfg
+            ss()["col_setup_ver"] = ver + 1   # force editor to re-initialise
+
             if old_rules != new_rules:
                 _init_groups(sorted(new_rules))
                 st.toast("Rule columns changed — groups have been reset.", icon="⚠️")
@@ -672,7 +695,8 @@ def _render_column_setup(df: pd.DataFrame) -> None:
             new_cfg = auto_detect_roles(df)
             for k in [k for k in ss() if k.startswith("catf_")]:
                 del ss()[k]
-            ss().col_config = new_cfg
+            ss().col_config      = new_cfg
+            ss()["col_setup_ver"] = ver + 1   # reset editor
             _init_groups(sorted(c for c, r in new_cfg.items() if r == "rule"))
             st.toast("Auto-detect complete.", icon="🔍")
             st.rerun()
@@ -690,7 +714,7 @@ def main() -> None:
         st.header("⚙️ Data Source")
         source = st.radio(
             "source",
-            ["🎲 Record-level Dummy Data", "🗂 Aggregated Dummy Data", "📂 Upload CSV"],
+            ["🎲 Record-level Dummy Data", "🗂 Aggregated Dummy Data", "📂 Upload File"],
             label_visibility="collapsed",
         )
         st.divider()
@@ -732,17 +756,30 @@ def main() -> None:
                     f"{n_rules} rules · aggregated mode"
                 )
 
-        # ── CSV upload ────────────────────────────────────────────────────────
+        # ── File upload (CSV or Parquet) ──────────────────────────────────────
         else:
-            uploaded = st.file_uploader("CSV file", type=["csv"])
+            uploaded = st.file_uploader(
+                "CSV or Parquet file",
+                type=["csv", "parquet"],
+                help="CSV files are read with pandas; Parquet files require the pyarrow package.",
+            )
             if uploaded:
-                with st.spinner("Reading CSV…"):
-                    df = pd.read_csv(uploaded, low_memory=False)
-                    for col in df.columns:
-                        if "date" in col.lower() or "time" in col.lower():
-                            parsed = pd.to_datetime(df[col], errors="coerce")
-                            if parsed.notna().mean() > 0.8:
-                                df[col] = parsed
+                fname = uploaded.name.lower()
+                with st.spinner(f"Reading {'Parquet' if fname.endswith('.parquet') else 'CSV'}…"):
+                    if fname.endswith(".parquet"):
+                        df = pd.read_parquet(uploaded)
+                    else:
+                        df = pd.read_csv(uploaded, low_memory=False)
+
+                    # Parse string columns that look like datetimes (CSV only —
+                    # Parquet preserves dtypes already)
+                    if not fname.endswith(".parquet"):
+                        for col in df.columns:
+                            if "date" in col.lower() or "time" in col.lower():
+                                parsed = pd.to_datetime(df[col], errors="coerce")
+                                if parsed.notna().mean() > 0.8:
+                                    df[col] = parsed
+
                     dt_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
                     if dt_cols:
                         dc = dt_cols[0]
