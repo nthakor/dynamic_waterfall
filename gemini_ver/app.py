@@ -237,10 +237,21 @@ with st.sidebar:
             badge_html += (
                 f'<span class="col-role-badge badge-date">📅 {cfg.date_col}</span>'
             )
-        if cfg.bad_col:
+        if cfg.data_mode == "aggregated":
             badge_html += (
-                f'<span class="col-role-badge badge-bad">🎯 {cfg.bad_col}</span>'
+                '<span class="col-role-badge badge-bad">📦 Aggregated mode</span>'
             )
+            if cfg.count_col:
+                badge_html += (
+                    f'<span class="col-role-badge badge-bad"># {cfg.count_col}</span>'
+                )
+            if cfg.bad_count_col:
+                badge_html += f'<span class="col-role-badge badge-bad">☠️ {cfg.bad_count_col}</span>'
+        else:
+            if cfg.bad_col:
+                badge_html += (
+                    f'<span class="col-role-badge badge-bad">🎯 {cfg.bad_col}</span>'
+                )
         for r in cfg.rule_cols[:6]:
             badge_html += f'<span class="col-role-badge badge-rule">⚖️ {r}</span>'
         if len(cfg.rule_cols) > 6:
@@ -257,11 +268,48 @@ with st.sidebar:
             options=["(none)"] + all_cols,
             index=(["(none)"] + all_cols).index(cfg.date_col) if cfg.date_col else 0,
         )
-        new_bad_col = st.selectbox(
-            "🎯 Bad / Target flag column",
-            options=["(none)"] + all_cols,
-            index=(["(none)"] + all_cols).index(cfg.bad_col) if cfg.bad_col else 0,
+
+        # ── Data mode ─────────────────────────────────────────────────
+        mode_opts = ["row_level", "aggregated"]
+        mode_label = {
+            "row_level": "🟢 Row-level  (1 row = 1 application)",
+            "aggregated": "🟡 Aggregated (1 row = many applications)",
+        }
+        new_data_mode = st.radio(
+            "Data Mode",
+            options=mode_opts,
+            index=mode_opts.index(cfg.data_mode),
+            format_func=lambda m: mode_label[m],
+            horizontal=False,
         )
+
+        if new_data_mode == "row_level":
+            new_bad_col = st.selectbox(
+                "🎯 Bad / Target flag column  (binary 0/1)",
+                options=["(none)"] + all_cols,
+                index=(["(none)"] + all_cols).index(cfg.bad_col) if cfg.bad_col else 0,
+            )
+            new_count_col = None
+            new_bad_count_col = None
+        else:
+            new_bad_col = None
+            # Numeric columns only for count selectors
+            num_cols = [c for c in all_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
+            new_count_col = st.selectbox(
+                "📦 Count column  (total apps per row)",
+                options=["(none)"] + num_cols,
+                index=(["(none)"] + num_cols).index(cfg.count_col)
+                if cfg.count_col and cfg.count_col in num_cols
+                else 0,
+            )
+            new_bad_count_col = st.selectbox(
+                "☠️ Bad count column  (bad apps per row)",
+                options=["(none)"] + num_cols,
+                index=(["(none)"] + num_cols).index(cfg.bad_count_col)
+                if cfg.bad_count_col and cfg.bad_count_col in num_cols
+                else 0,
+            )
+
         new_rule_cols = st.multiselect(
             "⚖️ Rule indicator columns",
             options=all_cols,
@@ -274,22 +322,26 @@ with st.sidebar:
         )
 
         if st.button("✅ Apply Column Config"):
+            _date = None if new_date_col == "(none)" else new_date_col
             new_cfg = ColumnConfig(
-                date_col=None if new_date_col == "(none)" else new_date_col,
-                bad_col=None if new_bad_col == "(none)" else new_bad_col,
+                date_col=_date,
+                bad_col=new_bad_col,
                 rule_cols=new_rule_cols,
                 cat_cols=new_cat_cols,
+                data_mode=new_data_mode,
+                count_col=None
+                if (not new_count_col or new_count_col == "(none)")
+                else new_count_col,
+                bad_count_col=None
+                if (not new_bad_count_col or new_bad_count_col == "(none)")
+                else new_bad_count_col,
             )
             st.session_state.col_config = new_cfg
             cfg = new_cfg
-
-            # Re-enrich date columns
             if cfg.date_col:
                 st.session_state.df_enriched = enrich_date_cols(df_raw, cfg.date_col)
             else:
                 st.session_state.df_enriched = df_raw
-
-            # Reset rule grouping if rule_cols changed
             st.session_state.ungrouped = list(cfg.rule_cols)
             st.session_state.groups = {}
             st.session_state.group_order = []
@@ -383,14 +435,29 @@ st.markdown(
 )
 
 # ─────────────────────────────────────────────
-# Guard: need bad_col
+# Guard: need bad metric columns
 # ─────────────────────────────────────────────
-if not cfg.bad_col or cfg.bad_col not in df.columns:
-    st.error(
-        "⚠️ No Bad / Target flag column is configured. "
-        "Open **Column Configuration** in the sidebar and select one."
-    )
-    st.stop()
+if cfg.data_mode == "row_level":
+    if not cfg.bad_col or cfg.bad_col not in df.columns:
+        st.error(
+            "⚠️ No Bad / Target flag column is configured.  "
+            "Open **Column Configuration** in the sidebar and select one, "
+            "or switch to **Aggregated** mode and configure `count_col` / `bad_count_col`."
+        )
+        st.stop()
+else:  # aggregated
+    if not cfg.count_col or cfg.count_col not in df.columns:
+        st.error(
+            "⚠️ **Aggregated mode** requires a **Count column** (total apps per row).  "
+            "Open **Column Configuration** in the sidebar and select one."
+        )
+        st.stop()
+    if not cfg.bad_count_col or cfg.bad_count_col not in df.columns:
+        st.error(
+            "⚠️ **Aggregated mode** requires a **Bad Count column** (bad apps per row).  "
+            "Open **Column Configuration** in the sidebar and select one."
+        )
+        st.stop()
 
 rule_cols = cfg.rule_cols
 
@@ -535,7 +602,13 @@ if not active_groups:
 
 with st.spinner("Computing waterfall…"):
     wf_df, summary = compute_waterfall(
-        df, active_groups, st.session_state.group_order, bad_col=cfg.bad_col
+        df,
+        active_groups,
+        st.session_state.group_order,
+        bad_col=cfg.bad_col,
+        data_mode=cfg.data_mode,
+        count_col=cfg.count_col,
+        bad_count_col=cfg.bad_count_col,
     )
 
 # ── KPI cards ─────────────────────────────────────────────────────────────
@@ -756,7 +829,14 @@ with col_br2:
 # ── Rule-level detail ──────────────────────────────────────────────────────
 with st.expander("🔍 Rule-level Statistics", expanded=False):
     with st.spinner("Computing rule stats…"):
-        rls_df = rule_level_stats(df, rule_cols, bad_col=cfg.bad_col)
+        rls_df = rule_level_stats(
+            df,
+            rule_cols,
+            bad_col=cfg.bad_col,
+            data_mode=cfg.data_mode,
+            count_col=cfg.count_col,
+            bad_count_col=cfg.bad_count_col,
+        )
     fig_rules = px.scatter(
         rls_df,
         x="hit_rate_pct",
